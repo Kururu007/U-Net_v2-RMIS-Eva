@@ -201,10 +201,10 @@ if __name__ == '__main__':
                         default=False, help='choose to do random flip rotation')
 
     parser.add_argument('--batchsize', type=int,
-                        default=64, help='training batch size')
+                        default=12, help='training batch size')
 
     parser.add_argument('--trainsize', type=int,
-                        default=224, help='training dataset size')
+                        default=512, help='training dataset size')
 
     parser.add_argument('--clip', type=float,
                         default=0.5, help='gradient clipping margin')
