@@ -5,7 +5,7 @@ import argparse
 from datetime import datetime
 from lib.pvt import PolypPVT
 from tabulate import tabulate
-from utils.dataloader import get_loader, test_dataset
+from utils.dataloader import get_loader, get_loader_QaTa, test_dataset
 from utils.utils import clip_gradient, adjust_lr, AvgMeter
 import torch.nn.functional as F
 import numpy as np
@@ -14,6 +14,47 @@ import wandb
 from unet_v2.UNet_v2 import UNetV2
 
 import matplotlib.pyplot as plt
+
+import torchmetrics
+from torchmetrics import Dice, Accuracy
+from torchmetrics.classification import BinaryJaccardIndex
+
+class SampleMeanBinaryJaccard(torchmetrics.Metric):
+    """先对 batch 内每个样本独立计算 Binary Jaccard Index，
+       然后对这些样本分数求平均。
+    """
+    higher_is_better: bool = True  # IoU 越大越好
+
+    def __init__(self, **kwargs):
+        super().__init__(dist_sync_on_step=False)
+        # 内部仍然用官方 BinaryJaccardIndex
+        self._jac = BinaryJaccardIndex(**kwargs)
+
+        # 累加样本级 IoU 之和与样本计数
+        self.add_state("sum_iou", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("n_items", default=torch.tensor(0),   dist_reduce_fx="sum")
+
+    def update(self, preds: torch.Tensor, target: torch.Tensor):
+        """
+        Args:
+            preds  : [B, ...]  二值预测
+            target : [B, ...]  二值标签
+        """
+        B = preds.shape[0]
+
+        # 将每个样本展平到一维后单独喂入 BinaryJaccardIndex
+        preds_flat  = preds.reshape(B, -1)
+        target_flat = target.reshape(B, -1)
+
+        for i in range(B):
+            score = self._jac(preds_flat[i], target_flat[i])  # 单样本 IoU
+            self._jac.reset()  # 清掉内部状态，下一样本重新计算
+            self.sum_iou += score
+            self.n_items += 1
+
+    def compute(self):
+        # 返回所有样本 IoU 的平均值
+        return self.sum_iou / self.n_items
 
 def structure_loss(pred, mask):
     if mask.shape[-1] != pred.shape[-1]:
@@ -31,105 +72,47 @@ def structure_loss(pred, mask):
     return (wbce + wiou).mean()
 
 
-def calcuate_score(gt, pred):
-    mae = np.mean(np.abs(gt-pred))
-
-    intersection_arr = (pred == 1) & (gt == 1)
-    intersection = np.sum(intersection_arr == 1)
-    num_gt = np.sum(gt)
-    num_pred = np.sum(pred)
-
-    smooth = 1e-5
-    iou = (intersection + smooth) / (num_gt+num_pred-intersection + smooth)
-    dice = (2 * intersection + smooth) / (num_gt + num_pred + smooth)
-
-    return dice, iou, mae
-
-
-def test_1(model, path, dataset):
-
-    data_path = os.path.join(path, dataset)
-    image_root = '{}/images/'.format(data_path)
-    gt_root = '{}/masks/'.format(data_path)
+def test(model, path):
+    image_root = '{}/images/'.format(path)
+    gt_root = '{}/masks/'.format(path)
     model.eval()
     num1 = len(os.listdir(gt_root))
-    test_loader = test_dataset(image_root, gt_root, 352)
-    DSC = 0.0
+    test_loader = test_dataset(image_root, gt_root, 224)
+    
+    macro_dice_meter = Dice(average='samples').cuda()
+    macro_miou_meter = SampleMeanBinaryJaccard().cuda()
+    micro_dice_meter = Dice().cuda()
+    micro_miou_meter = BinaryJaccardIndex().cuda()
+    micro_acc_meter = Accuracy(task='binary').cuda()
+    
     for i in range(num1):
         image, gt, name = test_loader.load_data()
         gt = np.asarray(gt, np.float32)
         gt /= (gt.max() + 1e-8)
         image = image.cuda()
-
-        res, res1  = model(image)
-        # eval Dice
-        res = F.upsample(res + res1, size=gt.shape, mode='bilinear', align_corners=False)
-        res = res.sigmoid().data.cpu().numpy().squeeze()
-        res = (res - res.min()) / (res.max() - res.min() + 1e-8)
-        input = res
-        target = np.array(gt)
-        N = gt.shape
-        smooth = 1
-        input_flat = np.reshape(input, (-1))
-        target_flat = np.reshape(target, (-1))
-        intersection = (input_flat * target_flat)
-        dice = (2 * intersection.sum() + smooth) / (input.sum() + target.sum() + smooth)
-        dice = '{:.4f}'.format(dice)
-        dice = float(dice)
-        DSC = DSC + dice
-
-    return DSC / num1
-
-
-def test(model, path, dataset):
-    data_path = os.path.join(path, dataset)
-    image_root = '{}/images/'.format(data_path)
-    gt_root = '{}/masks/'.format(data_path)
-    model.eval()
-    num1 = len(os.listdir(gt_root))
-    test_loader = test_dataset(image_root, gt_root, 352)
-    # DSC = 0.0
-    maes = []
-    dscs = []
-    ious = []
-    for i in range(num1):
-        image, gt, name = test_loader.load_data()
-        gt = np.asarray(gt, np.float32)
-        gt /= (gt.max() + 1e-8)
-        image = image.cuda()
+        gt = torch.from_numpy(gt).cuda()
 
         res, res1 = model(image)
         res1 = F.interpolate(res1, res.shape[-2:],  mode='bilinear', align_corners=False)
-        # eval Dice
         res = F.upsample(res + res1, size=gt.shape, mode='bilinear', align_corners=False)
-        res = res.sigmoid().data.cpu().numpy().squeeze()
-        res = (res - res.min()) / (res.max() - res.min() + 1e-8)
-        input = res
-        target = np.array(gt)
-        N = gt.shape
-        smooth = 1
-        input_flat = np.reshape(input, (-1))
-        target_flat = np.reshape(target, (-1))
-        # print(np.unique(input_flat))
-        input_flat = input_flat >= 0.5
-
-        dice, iou, mae = calcuate_score(target_flat, input_flat)
-        maes.append(mae)
-        dscs.append(dice)
-        ious.append(iou)
-        # mae.append(np.mean(np.abs(target_flat - input_flat)))
-        # # print(np.unique(input_flat))
-        # intersection = (input_flat * target_flat)
-        # dice = (2 * intersection.sum() + smooth) / (input.sum() + target.sum() + smooth)
-        # dice = '{:.4f}'.format(dice)
-        # dice = float(dice)
-        # DSC = DSC + dice
+        res = res.sigmoid().squeeze(0)
+        gt = gt.unsqueeze(0)
+        # print(res.size(), gt.size())
+        macro_dice_meter.update(res, gt.long())
+        macro_miou_meter.update(res, gt.long())
+        micro_dice_meter.update(res, gt.long())
+        micro_miou_meter.update(res, gt.long())
+        micro_acc_meter.update(res, gt.long())
 
     # return DSC / num1
-    return np.mean(dscs), np.mean(ious), np.mean(maes)
+    test_macro_dice = macro_dice_meter.compute().item()
+    test_macro_miou = macro_miou_meter.compute().item()
+    test_micro_dice = micro_dice_meter.compute().item()
+    test_micro_miou = micro_miou_meter.compute().item()
+    test_micro_acc = micro_acc_meter.compute().item()
+    return test_macro_dice, test_macro_miou, test_micro_dice, test_micro_miou, test_micro_acc
 
-
-def train(train_loader, model, optimizer, epoch, test_path):
+def train(train_loader, model, optimizer, epoch, test_path, state):
     model.train()
     global best
     size_rates = [0.75, 1, 1.25] 
@@ -147,7 +130,7 @@ def train(train_loader, model, optimizer, epoch, test_path):
                 images = F.upsample(images, size=(trainsize, trainsize), mode='bilinear', align_corners=True)
                 gts = F.upsample(gts, size=(trainsize, trainsize), mode='bilinear', align_corners=True)
             # ---- forward ----
-            P1, P2= model(images)
+            P1, P2 = model(images)
             # ---- loss function ----
             loss_P1 = structure_loss(P1, gts)
             loss_P2 = structure_loss(P2, gts)
@@ -160,7 +143,7 @@ def train(train_loader, model, optimizer, epoch, test_path):
             if rate == 1:
                 loss_P2_record.update(loss_P2.data, opt.batchsize)
         # ---- train visualization ----
-        if i % 20 == 0 or i == total_step:
+        if i % 10 == 0 or i == total_step:
             print('{} Epoch [{:03d}/{:03d}], Step [{:04d}/{:04d}], '
                   ' lateral-5: {:0.4f}]'.
                   format(datetime.now(), epoch, opt.epoch, i, total_step,
@@ -175,62 +158,28 @@ def train(train_loader, model, optimizer, epoch, test_path):
     if not os.path.exists(best_path):
         os.makedirs(best_path)
 
-    torch.save(model.state_dict(), os.path.join(latest_path,
-                                                f"epoch_{epoch}.pth"))
+    torch.save(model.state_dict(), os.path.join(latest_path, f"last.pth"))
     # choose the best model
-
-    global dict_plot
    
-    # test1path = './dataset/TestDataset/'
-    # test1path = '/afs/crc.nd.edu/user/y/ypeng4/data/raw_data/polyp/TestDataset'
     test1path = opt.test_path
 
-    dices = []
-    ious = []
-    maes = []
-    results = []
+    
     if (epoch + 1) % 1 == 0:
-        for dataset in ['CVC-300', 'CVC-ClinicDB', 'Kvasir', 'CVC-ColonDB', 'ETIS-LaribPolypDB']:
-            dsc, iou, mae = test(model, test1path, dataset)
+        test_macro_dice, test_macro_miou, test_micro_dice, test_micro_miou, test_micro_acc = test(model, test1path)
 
-            wandb.log({f"dsc/{dataset}": dsc}, step=epoch)
-            wandb.log({f"iou/{dataset}": iou}, step=epoch)
-            wandb.log({f"mae/{dataset}": mae}, step=epoch)
-
-            dices.append(dsc)
-            ious.append(iou)
-            maes.append(mae)
-
-            results.append([dataset, dsc, iou, mae])
-
-        mean_dice = np.mean(dices)
-
-        results.append(['mean', np.mean(dices), np.mean(ious), np.mean(maes)])
-        wandb.log({f"mean_dsc": mean_dice}, step=epoch)
-
-        tab = tabulate(results, headers=['dataset', 'dsc', 'iou', 'mae'], floatfmt=".3f")
-
-        print(tab)
-        if mean_dice > best:
-            best = mean_dice
-            # torch.save(model.state_dict(), save_path + 'PolypPVT.pth')
+        wandb.log({f"QaTa/mDice": test_macro_dice}, step=epoch)
+        wandb.log({f"QaTa/mIoU": test_macro_miou}, step=epoch)
+        wandb.log({f"QaTa/gDice": test_micro_dice}, step=epoch)
+        wandb.log({f"QaTa/gIoU": test_micro_miou}, step=epoch)
+        wandb.log({f"QaTa/Acc": test_micro_acc}, step=epoch)
+        
+        print(f'Testing performance in val model: mDice : %f, mIoU : %f, gDice : %f, gIoU : %f, Acc. : %f' % (test_macro_dice, test_macro_miou, test_micro_dice, test_micro_miou, test_micro_acc))
+        
+        if test_macro_dice > state["best_mdice"]:
+            state["best_mdice"] = float(test_macro_dice)
+            state["best_epoch"] = epoch
             torch.save(model.state_dict(), os.path.join(best_path, f"best_epoch_{epoch}.pth"))
-            print(f'got best dice {best} at epoch {epoch}'.center(70, '='))
-
-
-def plot_train(dict_plot=None, name = None):
-    color = ['red', 'lawngreen', 'lime', 'gold', 'm', 'plum', 'blue']
-    line = ['-', "--"]
-    for i in range(len(name)):
-        plt.plot(dict_plot[name[i]], label=name[i], color=color[i], linestyle=line[(i + 1) % 2])
-        transfuse = {'CVC-300': 0.902, 'CVC-ClinicDB': 0.918, 'Kvasir': 0.918, 'CVC-ColonDB': 0.773,'ETIS-LaribPolypDB': 0.733, 'test':0.83}
-        plt.axhline(y=transfuse[name[i]], color=color[i], linestyle='-')
-    plt.xlabel("epoch")
-    plt.ylabel("dice")
-    plt.title('Train')
-    plt.legend()
-    plt.savefig('eval.png')
-    # plt.show()
+            print(f'got best mdice {state["best_mdice"]} at epoch {epoch}'.center(70, '='))
     
     
 if __name__ == '__main__':
@@ -254,10 +203,10 @@ if __name__ == '__main__':
                         default=False, help='choose to do random flip rotation')
 
     parser.add_argument('--batchsize', type=int,
-                        default=16, help='training batch size')
+                        default=64, help='training batch size')
 
     parser.add_argument('--trainsize', type=int,
-                        default=352, help='training dataset size')
+                        default=224, help='training dataset size')
 
     parser.add_argument('--clip', type=float,
                         default=0.5, help='gradient clipping margin')
@@ -298,7 +247,7 @@ if __name__ == '__main__':
 
     # wandb.login(key="66b58ac7004a123a43487d7a6cf34ebb4571a7ea")
     wandb.login(key="cd32109501327dc0c5d7a1e1600e2f122ff5a0ed")
-    wandb.init(project="Polyp_ori_latest",
+    wandb.init(project="UNet_v2_QaTa",
             #    dir="./wandb",
                name=model.__class__.__name__,
                resume="allow",  # must resume, otherwise crash
@@ -318,15 +267,14 @@ if __name__ == '__main__':
     image_root = '{}/images/'.format(opt.train_path)
     gt_root = '{}/masks/'.format(opt.train_path)
 
-    train_loader = get_loader(image_root, gt_root, batchsize=opt.batchsize, trainsize=opt.trainsize,
-                              augmentation=opt.augmentation)
+    train_loader = get_loader_QaTa(image_root, gt_root, batchsize=opt.batchsize, trainsize=opt.trainsize, augmentation=opt.augmentation)
     total_step = len(train_loader)
 
     print("#" * 20, "Start Training", "#" * 20)
+    
+    state = {"best_mdice": -1.0, "best_epoch": -1}
 
     for epoch in range(1, opt.epoch):
         adjust_lr(optimizer, opt.lr, epoch, 0.1, 200)
-        train(train_loader, model, optimizer, epoch, opt.test_path)
+        train(train_loader, model, optimizer, epoch, opt.test_path, state)
     
-    # plot the eval.png in the training stage
-    # plot_train(dict_plot, name)
