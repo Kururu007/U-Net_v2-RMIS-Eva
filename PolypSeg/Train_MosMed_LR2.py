@@ -201,7 +201,7 @@ if __name__ == '__main__':
                         default=False, help='choose to do random flip rotation')
 
     parser.add_argument('--batchsize', type=int,
-                        default=32, help='training batch size')
+                        default=24, help='training batch size')
 
     parser.add_argument('--trainsize', type=int,
                         default=352, help='training dataset size')
