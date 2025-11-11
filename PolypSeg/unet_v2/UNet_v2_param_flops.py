@@ -205,6 +205,6 @@ if __name__ == "__main__":
     # for y in ys:
         # print(y.shape)
     from fvcore.nn import FlopCountAnalysis, flop_count_table
-    input_tensor = torch.randn(1, 3, 512, 512).cuda()
+    input_tensor = torch.randn(1, 3, 352, 352).cuda()
     flops = FlopCountAnalysis(model, (input_tensor))
     print(flop_count_table(flops, max_depth=3))
